@@ -122,7 +122,8 @@ func (serversInfo *ServersInfo) getOne() (serverInfo *serverinfo) {
 		return nil
 	}
 
-	// Create a slice of healthy servers
+	// Create a slice of healthy servers. A server is considered healthy if it
+	// has not been marked as unhealthy and its status is not DEnd or Paused.
 	var healthyServers []*serverinfo
 	for _, si := range serversInfo.inner {
 		if si != nil && dnsx.WillErr(si) == nil {
@@ -130,8 +131,9 @@ func (serversInfo *ServersInfo) getOne() (serverInfo *serverinfo) {
 		}
 	}
 
+	// If there are healthy servers, sort them by latency and return the best one.
 	if len(healthyServers) > 0 {
-		// Sort healthy servers by latency (p50)
+		// Sort healthy servers by latency (p50) in ascending order.
 		sort.Slice(healthyServers, func(i, j int) bool {
 			return healthyServers[i].P50() < healthyServers[j].P50()
 		})
@@ -142,7 +144,9 @@ func (serversInfo *ServersInfo) getOne() (serverInfo *serverinfo) {
 		return serverInfo
 	}
 
-	// if no healthy servers are found, fallback to the original random selection
+	// If no healthy servers are found, fallback to the original random selection.
+	// This ensures that the client can still attempt to resolve DNS queries
+	// even if all servers are marked as unhealthy.
 	selectAny := false
 	candidate := rand.Intn(serversCount)
 retry:
@@ -312,6 +316,8 @@ func fetchDNSCryptServerInfo(proxy *DcMulti, name string, stamp stamps.ServerSta
 		lastErr:            core.NewVolatile[int64](0),
 	}
 
+	// This goroutine periodically checks the health of the server, updating
+	// its latency and marking it as healthy or unhealthy.
 	go func() {
 		timer := time.NewTicker(60 * time.Second) // Periodically check health
 		defer timer.Stop()
@@ -429,6 +435,9 @@ func (s *serverinfo) Query(network string, q *dns.Msg, smm *x.DNSSummary) (r *dn
 	r, err = resolve(network, q, s, smm)
 	s.status.Store(smm.Status)
 
+	// If the query fails, mark the server as unhealthy and record the time.
+	// This will prevent the server from being selected for new queries until
+	// it is marked as healthy again by the periodic health check.
 	if err != nil {
 		s.unhealthy.Store(true)
 		s.lastErr.Store(time.Now().Unix())
@@ -492,22 +501,19 @@ func (s *serverinfo) Status() int {
 }
 
 func (s *serverinfo) checkHealth() {
-	if !s.unhealthy.Load() {
-		return
-	}
-	// If the server was marked as unhealthy, check if it's time to re-check
-	if time.Since(time.Unix(s.lastErr.Load(), 0)) < 60*time.Second {
-		return
-	}
-
+	// Send a test query to the server to check its health and latency.
 	q := new(dns.Msg)
 	q.SetQuestion(".", dns.TypeNS)
 	smm := &x.DNSSummary{}
 	_, err := s.Query(dnsx.NetTypeUDP, q, smm)
+
+	// Log the health check result.
 	if err == nil {
 		s.unhealthy.Store(false)
-		log.I("dnscrypt: server %s is back online", s.Name)
+		log.I("dnscrypt: health check for %s successful, latency: %dms", s.Name, s.P50())
 	} else {
+		s.unhealthy.Store(true)
+		s.lastErr.Store(time.Now().Unix())
 		log.W("dnscrypt: health check for %s failed: %v", s.Name, err)
 	}
 }

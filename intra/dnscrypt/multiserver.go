@@ -426,6 +426,9 @@ func (proxy *DcMulti) start() error {
 
 	_, err := proxy.Refresh()
 
+	// This goroutine periodically refreshes the certificates.
+	// It uses a single timer that adjusts its delay based on success or failure,
+	// making the retry mechanism more reliable and resilient.
 	go func() {
 		var delay time.Duration
 		if len(proxy.liveServers) > 0 {
@@ -443,21 +446,26 @@ func (proxy *DcMulti) start() error {
 				log.I("dnscrypt: cert refresh stopped")
 				return
 			case <-timer.C:
+				// If there are no registered servers, wait for the full refresh delay.
 				hasRegisteredServers := proxy.serversInfo.len() > 0
 				if !hasRegisteredServers {
 					log.D("dnscrypt: no registered servers; next check after %v", certRefreshDelay)
 					timer.Reset(certRefreshDelay)
 					continue
 				}
+
+				// Attempt to refresh the certificates for all registered servers.
 				live, refreshErr := proxy.serversInfo.refresh(proxy)
 
 				proxy.Lock()
 				proxy.liveServers = live
 				if len(proxy.liveServers) > 0 {
+					// If the refresh is successful, use the standard refresh delay.
 					log.I("dnscrypt: cert refresh success, next check in %v", certRefreshDelay)
 					proxy.certIgnoreTimestamp = false
 					delay = certRefreshDelay
 				} else {
+					// If the refresh fails, use a shorter delay to retry sooner.
 					log.W("dnscrypt: all servers dead; retry in %v, err: %v", certRefreshDelayAfterFailure, refreshErr)
 					proxy.certIgnoreTimestamp = true
 					delay = certRefreshDelayAfterFailure
