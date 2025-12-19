@@ -425,44 +425,57 @@ func (proxy *DcMulti) start() error {
 	curve25519.ScalarBaseMult(&proxy.proxyPublicKey, &proxy.proxySecretKey)
 
 	_, err := proxy.Refresh()
-	_ = core.Periodic("dcmulti.start", proxy.ctx, certRefreshDelay, func() {
-		maxtries := 10
-		i := 0
+
+	// This goroutine periodically refreshes the certificates.
+	// It uses a single timer that adjusts its delay based on success or failure,
+	// making the retry mechanism more reliable and resilient.
+	go func() {
+		var delay time.Duration
+		if len(proxy.liveServers) > 0 {
+			delay = certRefreshDelay
+		} else {
+			delay = certRefreshDelayAfterFailure
+		}
+
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+
 		for {
-			i++
-			if i > maxtries {
-				log.E("dnscrypt: cert refresh failed after %d tries", maxtries)
-				return
-			}
 			select {
 			case <-proxy.ctx.Done():
 				log.I("dnscrypt: cert refresh stopped")
 				return
-			default:
-			}
+			case <-timer.C:
+				// If there are no registered servers, wait for the full refresh delay.
+				hasRegisteredServers := proxy.serversInfo.len() > 0
+				if !hasRegisteredServers {
+					log.D("dnscrypt: no registered servers; next check after %v", certRefreshDelay)
+					timer.Reset(certRefreshDelay)
+					continue
+				}
 
-			hasServers := proxy.serversInfo.len() > 0
-			if !hasServers {
-				log.D("dnscrypt: no servers; next check after %v", certRefreshDelayAfterFailure)
-				return
-			}
-			proxy.liveServers, _ = proxy.serversInfo.refresh(proxy)
-			if someAlive := len(proxy.liveServers) > 0; someAlive {
-				log.I("dnscrypt: some servers alive; retry #%d; next check after",
-					i, certRefreshDelayAfterFailure)
-				proxy.certIgnoreTimestamp = false
-				return
-			}
-			proxy.certIgnoreTimestamp = true
-			backoff := time.Duration(i) * time.Second
-			wait := certRefreshDelayAfterFailure * backoff
-			log.W("dnscrypt: all servers dead; retry #%d in %v", i, wait)
-			time.Sleep(wait)
-			continue
+				// Attempt to refresh the certificates for all registered servers.
+				live, refreshErr := proxy.serversInfo.refresh(proxy)
 
+				proxy.Lock()
+				proxy.liveServers = live
+				if len(proxy.liveServers) > 0 {
+					// If the refresh is successful, use the standard refresh delay.
+					log.I("dnscrypt: cert refresh success, next check in %v", certRefreshDelay)
+					proxy.certIgnoreTimestamp = false
+					delay = certRefreshDelay
+				} else {
+					// If the refresh fails, use a shorter delay to retry sooner.
+					log.W("dnscrypt: all servers dead; retry in %v, err: %v", certRefreshDelayAfterFailure, refreshErr)
+					proxy.certIgnoreTimestamp = true
+					delay = certRefreshDelayAfterFailure
+				}
+				proxy.Unlock()
+				timer.Reset(delay)
+			}
 		}
-	})
-	// todo: on error: context.AfterFunc(refreshCtx, proxy.notifyRestart)
+	}()
+
 	return err
 }
 

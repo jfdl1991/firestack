@@ -23,9 +23,11 @@ import (
 	"math/rand"
 	"net"
 	"net/netip"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	x "github.com/celzero/firestack/intra/backend"
 	"github.com/celzero/firestack/intra/core"
@@ -68,6 +70,8 @@ type serverinfo struct {
 	RelayUDPAddrs *core.Volatile[[]*net.UDPAddr] // anonymous relays, if any
 	RelayTCPAddrs *core.Volatile[[]*net.TCPAddr] // anonymous relays, if any
 	status        *core.Volatile[int]            // status of the last query
+	unhealthy     *core.Volatile[bool]
+	lastErr       *core.Volatile[int64] // unix timestamp of the last error
 }
 
 var _ dnsx.Transport = (*serverinfo)(nil)
@@ -117,13 +121,39 @@ func (serversInfo *ServersInfo) getOne() (serverInfo *serverinfo) {
 	if serversCount <= 0 {
 		return nil
 	}
+
+	// Create a slice of healthy servers. A server is considered healthy if it
+	// has not been marked as unhealthy and its status is not DEnd or Paused.
+	var healthyServers []*serverinfo
+	for _, si := range serversInfo.inner {
+		if si != nil && dnsx.WillErr(si) == nil {
+			healthyServers = append(healthyServers, si)
+		}
+	}
+
+	// If there are healthy servers, sort them by latency and return the best one.
+	if len(healthyServers) > 0 {
+		// Sort healthy servers by latency (p50) in ascending order.
+		sort.Slice(healthyServers, func(i, j int) bool {
+			return healthyServers[i].P50() < healthyServers[j].P50()
+		})
+		serverInfo = healthyServers[0]
+		if settings.Debug {
+			log.V("dnscrypt: selected candidate [%v] with p50 [%d]", serverInfo, serverInfo.P50())
+		}
+		return serverInfo
+	}
+
+	// If no healthy servers are found, fallback to the original random selection.
+	// This ensures that the client can still attempt to resolve DNS queries
+	// even if all servers are marked as unhealthy.
 	selectAny := false
 	candidate := rand.Intn(serversCount)
 retry:
 	i := 0
 	for _, si := range serversInfo.inner {
 		if i == candidate || selectAny {
-			if si != nil && dnsx.WillErr(si) == nil {
+			if si != nil {
 				if settings.Debug {
 					log.V("dnscrypt: candidate [%v]", si) // may be nil?
 				}
@@ -282,7 +312,26 @@ func fetchDNSCryptServerInfo(proxy *DcMulti, name string, stamp stamps.ServerSta
 		relay:              relay,
 		est:                core.NewP50Estimator(ctx),
 		status:             core.NewVolatile(dnsx.Start),
+		unhealthy:          core.NewVolatile(false),
+		lastErr:            core.NewVolatile[int64](0),
 	}
+
+	// This goroutine periodically checks the health of the server, updating
+	// its latency and marking it as healthy or unhealthy.
+	go func() {
+		timer := time.NewTicker(60 * time.Second) // Periodically check health
+		defer timer.Stop()
+
+		for {
+			select {
+			case <-si.ctx.Done():
+				return
+			case <-timer.C:
+				si.checkHealth()
+			}
+		}
+	}()
+
 	log.I("dnscrypt: (%s) setup: %s; anonrelay? %t, proxy? %t", name, si.HostName, len(relay) > 0)
 	return si, nil
 }
@@ -386,11 +435,19 @@ func (s *serverinfo) Query(network string, q *dns.Msg, smm *x.DNSSummary) (r *dn
 	r, err = resolve(network, q, s, smm)
 	s.status.Store(smm.Status)
 
+	// If the query fails, mark the server as unhealthy and record the time.
+	// This will prevent the server from being selected for new queries until
+	// it is marked as healthy again by the periodic health check.
+	if err != nil {
+		s.unhealthy.Store(true)
+		s.lastErr.Store(time.Now().Unix())
+		smm.Msg = err.Error()
+	} else {
+		s.unhealthy.Store(false)
+	}
+
 	if s.est != nil {
 		s.est.Add(smm.Latency)
-	}
-	if err != nil {
-		smm.Msg = err.Error()
 	}
 
 	return
@@ -432,12 +489,33 @@ func (s *serverinfo) IPPorts() []netip.AddrPort {
 }
 
 func (s *serverinfo) Status() int {
+	if s.unhealthy.Load() {
+		return dnsx.DEnd
+	}
 	if px := s.getRelay(); px != nil {
 		if px.Status() == ipn.TPU {
 			return dnsx.Paused
 		}
 	}
 	return s.status.Load()
+}
+
+func (s *serverinfo) checkHealth() {
+	// Send a test query to the server to check its health and latency.
+	q := new(dns.Msg)
+	q.SetQuestion(".", dns.TypeNS)
+	smm := &x.DNSSummary{}
+	_, err := s.Query(dnsx.NetTypeUDP, q, smm)
+
+	// Log the health check result.
+	if err == nil {
+		s.unhealthy.Store(false)
+		log.I("dnscrypt: health check for %s successful, latency: %dms", s.Name, s.P50())
+	} else {
+		s.unhealthy.Store(true)
+		s.lastErr.Store(time.Now().Unix())
+		log.W("dnscrypt: health check for %s failed: %v", s.Name, err)
+	}
 }
 
 func (s *serverinfo) Stop() error {
