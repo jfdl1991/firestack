@@ -425,44 +425,49 @@ func (proxy *DcMulti) start() error {
 	curve25519.ScalarBaseMult(&proxy.proxyPublicKey, &proxy.proxySecretKey)
 
 	_, err := proxy.Refresh()
-	_ = core.Periodic("dcmulti.start", proxy.ctx, certRefreshDelay, func() {
-		maxtries := 10
-		i := 0
+
+	go func() {
+		var delay time.Duration
+		if len(proxy.liveServers) > 0 {
+			delay = certRefreshDelay
+		} else {
+			delay = certRefreshDelayAfterFailure
+		}
+
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+
 		for {
-			i++
-			if i > maxtries {
-				log.E("dnscrypt: cert refresh failed after %d tries", maxtries)
-				return
-			}
 			select {
 			case <-proxy.ctx.Done():
 				log.I("dnscrypt: cert refresh stopped")
 				return
-			default:
-			}
+			case <-timer.C:
+				hasRegisteredServers := proxy.serversInfo.len() > 0
+				if !hasRegisteredServers {
+					log.D("dnscrypt: no registered servers; next check after %v", certRefreshDelay)
+					timer.Reset(certRefreshDelay)
+					continue
+				}
+				live, refreshErr := proxy.serversInfo.refresh(proxy)
 
-			hasServers := proxy.serversInfo.len() > 0
-			if !hasServers {
-				log.D("dnscrypt: no servers; next check after %v", certRefreshDelayAfterFailure)
-				return
+				proxy.Lock()
+				proxy.liveServers = live
+				if len(proxy.liveServers) > 0 {
+					log.I("dnscrypt: cert refresh success, next check in %v", certRefreshDelay)
+					proxy.certIgnoreTimestamp = false
+					delay = certRefreshDelay
+				} else {
+					log.W("dnscrypt: all servers dead; retry in %v, err: %v", certRefreshDelayAfterFailure, refreshErr)
+					proxy.certIgnoreTimestamp = true
+					delay = certRefreshDelayAfterFailure
+				}
+				proxy.Unlock()
+				timer.Reset(delay)
 			}
-			proxy.liveServers, _ = proxy.serversInfo.refresh(proxy)
-			if someAlive := len(proxy.liveServers) > 0; someAlive {
-				log.I("dnscrypt: some servers alive; retry #%d; next check after",
-					i, certRefreshDelayAfterFailure)
-				proxy.certIgnoreTimestamp = false
-				return
-			}
-			proxy.certIgnoreTimestamp = true
-			backoff := time.Duration(i) * time.Second
-			wait := certRefreshDelayAfterFailure * backoff
-			log.W("dnscrypt: all servers dead; retry #%d in %v", i, wait)
-			time.Sleep(wait)
-			continue
-
 		}
-	})
-	// todo: on error: context.AfterFunc(refreshCtx, proxy.notifyRestart)
+	}()
+
 	return err
 }
 
